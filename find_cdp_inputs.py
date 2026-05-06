@@ -13,7 +13,7 @@ import pefile
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from pe_signature_finder import analyze_symbols, demangle_symbol  # type: ignore
+from pe_signature_finder import analyze_symbols, demangle_symbol, format_bytes  # type: ignore
 
 
 # From the current CDP-Enabler project: the Chrome/Edge allocator used for the
@@ -45,6 +45,10 @@ def find_unique_regex(pattern: bytes, data: bytes) -> int:
     if len(matches) != 1:
         raise RuntimeError(f"expected exactly one match, got {len(matches)}")
     return matches[0]
+
+
+def format_c_initializer(data: bytes) -> str:
+    return ", ".join(f"0x{b:02X}" for b in data)
 
 
 def choose_tcp_factory_entry1(pe_path: Path, pdb_path: Path):
@@ -114,15 +118,20 @@ def main():
             "rva": f"0x{operator_new_rva:08X}",
             "va": f"0x{image_base + operator_new_rva:016X}",
             "signature": OPERATOR_NEW_SIGNATURE,
+            "copy_to_code": "OPERATOR_NEW_SIG",
         },
         "tcp_server_socket_factory": {
             "create_for_http_server": {
                 "rva": f"0x{entry1_rva:08X}",
                 "va": f"0x{entry1_va:016X}",
+                "signature_hex": format_bytes(entry1_sig),
+                "signature_c_initializer": format_c_initializer(entry1_sig),
+                "copy_to_code": "EDGE_ENTRY1_SIG" if args.pe.name.lower() == "msedge.dll" else "CHROME_ENTRY1_SIG",
                 "derived_vtable_entry1_candidates": [f"0x{candidate:08X}" for candidate in vtable_candidates],
                 "vtable_entry1_rva": f"0x{vtable_entry1_rva:08X}",
                 "vtable_rva": f"0x{vtable_entry1_rva - 8:08X}",
                 "vtable_va": f"0x{image_base + vtable_entry1_rva - 8:016X}",
+                "note": "The script emits the CreateForHttpServer function signature and derives the vtable location. The PIC code still uses VTABLE_ENTRY0_SIG / VTABLE_ENTRY0_MASK for vtable matching if that helper drifts.",
             },
             "layout": {
                 "size": 16,
