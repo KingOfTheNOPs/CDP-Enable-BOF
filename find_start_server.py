@@ -15,6 +15,12 @@ sys.path.insert(0, str(ROOT))
 from pe_signature_finder import analyze_symbols, format_bytes  # type: ignore
 
 
+CODE_SIGNATURE_LENGTHS = {
+    "msedge.dll": 64,
+    "chrome.dll": 62,
+}
+
+
 def format_c_initializer(data: bytes) -> str:
     return ", ".join(f"0x{b:02X}" for b in data)
 
@@ -61,12 +67,19 @@ def main():
             raise SystemExit("failed to derive a unique StartRemoteDebuggingServer signature from the PDB")
 
         result = good[0]
-        signature = result.signature
-        assert signature is not None
+        unique_signature = result.signature
+        assert unique_signature is not None
+        code_sig_len = CODE_SIGNATURE_LENGTHS.get(args.pe.name.lower(), len(unique_signature))
+        sig_rva = result.symbol.rva
+        text_rva = _text_section.VirtualAddress
+        sig_off = sig_rva - text_rva
+        if sig_off < 0 or sig_off + code_sig_len > len(text_data):
+            raise SystemExit("failed to extract full code signature bytes from .text")
+        signature = text_data[sig_off : sig_off + code_sig_len]
         output["pdb"] = str(args.pdb)
         output["symbol"] = result.symbol.name
-        output["signature_rva"] = f"0x{result.symbol.rva:08X}"
-        output["signature_va"] = f"0x{pe.OPTIONAL_HEADER.ImageBase + result.symbol.rva:016X}"
+        output["signature_rva"] = f"0x{sig_rva:08X}"
+        output["signature_va"] = f"0x{pe.OPTIONAL_HEADER.ImageBase + sig_rva:016X}"
         output["signature_length"] = len(signature)
         output["signature_hex"] = format_bytes(signature)
         output["signature_c_initializer"] = format_c_initializer(signature)
