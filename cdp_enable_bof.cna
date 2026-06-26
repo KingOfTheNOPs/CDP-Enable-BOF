@@ -31,7 +31,7 @@ alias cdp_enable {
     }
 
     if ($port <= 8999 || $port > 65535) {
-        berror($1, "port must be between 1 and 65535");
+        berror($1, "port must be between 9000 and 65535");
         return;
     }
 
