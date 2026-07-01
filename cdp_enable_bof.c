@@ -274,7 +274,7 @@ static void bof_memcpy(void* dst, const void* src, SIZE_T len) {
 
 static void bof_memset(void* dst, int c, SIZE_T len) {
     SIZE_T i;
-    unsigned char* d = (unsigned char*)dst;
+    volatile unsigned char* d = (unsigned char*)dst;
     for (i = 0; i < len; i++) d[i] = (unsigned char)c;
 }
 
