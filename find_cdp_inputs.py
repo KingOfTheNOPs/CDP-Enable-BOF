@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import contextlib
-import io
 import json
 import re
 import struct
@@ -13,7 +11,7 @@ import pefile
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from pe_signature_finder import analyze_symbols, demangle_symbol, format_bytes  # type: ignore
+from pe_signature_finder import PDBParser, demangle_symbol, format_bytes  # type: ignore
 
 
 # From the current CDP-Enabler project: the Chrome/Edge allocator used for the
@@ -22,12 +20,25 @@ OPERATOR_NEW_REGEX = (
     rb"\x40\x53\x48\x83\xEC\x20\x48\x8B\xD9\xEB."
     rb"\x48\x8B\xCB\xE8....\x85\xC0\x74.\x48\x8B\xCB"
 )
-OPERATOR_NEW_SIGNATURE = "40 53 48 83 EC 20 48 8B D9 EB ?? 48 8B CB E8 ?? ?? ?? ?? 85 C0 74 ?? 48 8B CB"
-
-KNOWN_ENTRY1_SIGNATURES = {
-    "msedge.dll": bytes.fromhex("48 89 D0 0F B7 51 08 48"),
-    "chrome.dll": bytes.fromhex(
-        "41 57 41 56 56 57 55 53 48 81 EC 88 00 00 00 48 89 D6 48 8B 05 07"
+KNOWN_ENTRY1_PATTERNS = {
+    "msedge.dll": (
+        bytes.fromhex("48 89 D0 0F B7 51 08 48"),
+        (1,) * 8,
+    ),
+    "chrome.dll": (
+        bytes.fromhex(
+            "41 57 41 56 56 57 55 53 48 81 EC 88 00 00 00 "
+            "48 89 D6 48 8B 05 00 00 00 00 "
+            "48 31 E0 48 89 84 24 80 00 00 00 "
+            "0F B7 59 08 B9 38 00 00 00 E8 00 00 00 00 "
+            "48 89 C7 48 8B 05 00 00 00 00 48 8D 0D 00 00 00 00"
+        ),
+        (
+            (1,) * 21 + (0,) * 4 +
+            (1,) * 21 + (0,) * 4 +
+            (1,) * 6 + (0,) * 4 +
+            (1,) * 3 + (0,) * 4
+        ),
     ),
 }
 
@@ -51,24 +62,66 @@ def format_c_initializer(data: bytes) -> str:
     return ", ".join(f"0x{b:02X}" for b in data)
 
 
-def choose_tcp_factory_entry1(pe_path: Path, pdb_path: Path):
-    with contextlib.redirect_stderr(io.StringIO()):
-        results = list(
-            analyze_symbols(
-                str(pe_path),
-                str(pdb_path),
-                "*CreateForHttpServer*",
-                min_sig=8,
-                max_sig=64,
-            )
+def format_c_mask(mask) -> str:
+    return ",".join(str(value) for value in mask)
+
+
+def compile_masked_pattern(signature: bytes, mask) -> bytes:
+    if len(signature) != len(mask):
+        raise ValueError("signature and mask lengths differ")
+    return b"".join(
+        re.escape(bytes((value,))) if fixed else b"."
+        for value, fixed in zip(signature, mask)
+    )
+
+
+def masked_match_at(data: bytes, offset: int, signature: bytes, mask) -> bool:
+    if offset < 0 or offset + len(signature) > len(data):
+        return False
+    return all(not fixed or data[offset + i] == value for i, (value, fixed) in enumerate(zip(signature, mask)))
+
+
+def find_minimum_unique_signature(data: bytes, offset: int, min_length=8, max_length=64):
+    if offset < 0 or offset + min_length > len(data):
+        raise RuntimeError("PDB symbol RVA is outside .text")
+    max_length = min(max_length, len(data) - offset)
+    for length in range(min_length, max_length + 1):
+        signature = data[offset : offset + length]
+        first = data.find(signature)
+        if first == offset and data.find(signature, first + 1) == -1:
+            return signature
+    raise RuntimeError(f"failed to derive a unique signature within {max_length} bytes")
+
+
+def choose_internal_symbols(pe, pdb_path: Path):
+    parser = PDBParser(str(pdb_path), pe)
+    operator_new = [sym for sym in parser.symbols if sym.name == "??2@YAPEAX_K@Z"]
+    entry1 = [
+        sym for sym in parser.symbols
+        if sym.name.startswith("?CreateForHttpServer@TCPServerSocketFactory@")
+    ]
+    if len(operator_new) != 1:
+        raise RuntimeError(f"expected one operator new symbol in the PDB, got {len(operator_new)}")
+    if len(entry1) != 1:
+        raise RuntimeError(
+            "expected one TCPServerSocketFactory::CreateForHttpServer symbol "
+            f"in the PDB, got {len(entry1)}"
         )
+    return operator_new[0], entry1[0]
 
-    for result in results:
-        demangled = demangle_symbol(result.symbol.name)
-        if "TCPServerSocketFactory::CreateForHttpServer()" in demangled:
-            return result, demangled
 
-    raise RuntimeError("TCPServerSocketFactory::CreateForHttpServer was not found in the PDB")
+def find_vtable_candidates(rdata_data: bytes, rdata_rva: int, entry1_va: int, image_base: int,
+                           text_rva: int, text_size: int):
+    candidates = []
+    needle = struct.pack("<Q", entry1_va)
+    offset = rdata_data.find(needle)
+    while offset != -1:
+        if offset >= 8 and offset % 8 == 0:
+            q0 = struct.unpack_from("<Q", rdata_data, offset - 8)[0]
+            if image_base + text_rva <= q0 < image_base + text_rva + text_size:
+                candidates.append(rdata_rva + offset)
+        offset = rdata_data.find(needle, offset + 1)
+    return candidates
 
 
 def main():
@@ -84,28 +137,53 @@ def main():
     text_section, text_data = get_section(pe, ".text")
     rdata_section, rdata_data = get_section(pe, ".rdata")
 
-    operator_new_off = find_unique_regex(OPERATOR_NEW_REGEX, text_data)
-    operator_new_rva = text_section.VirtualAddress + operator_new_off
+    known_entry1 = KNOWN_ENTRY1_PATTERNS.get(args.pe.name.lower())
 
-    entry1_sig = KNOWN_ENTRY1_SIGNATURES.get(args.pe.name.lower())
-    if entry1_sig is None:
-        raise RuntimeError(f"no built-in CreateForHttpServer signature for {args.pe.name}")
+    if args.pdb:
+        operator_new_symbol, entry1_symbol = choose_internal_symbols(pe, args.pdb)
+        operator_new_rva = operator_new_symbol.rva
+        operator_new_off = operator_new_rva - text_section.VirtualAddress
+        operator_new_sig = find_minimum_unique_signature(text_data, operator_new_off)
+        operator_new_mask = (1,) * len(operator_new_sig)
 
-    entry1_off = find_unique_regex(re.escape(entry1_sig), text_data)
-    entry1_sig_rva = text_section.VirtualAddress + entry1_off
-    entry1_rva = entry1_sig_rva
+        entry1_rva = entry1_symbol.rva
+        entry1_off = entry1_rva - text_section.VirtualAddress
+        if known_entry1 and masked_match_at(text_data, entry1_off, *known_entry1):
+            entry1_sig, entry1_mask = known_entry1
+            entry1_signature_source = "PDB RVA with reusable masked layout"
+        else:
+            entry1_sig = find_minimum_unique_signature(text_data, entry1_off)
+            entry1_mask = (1,) * len(entry1_sig)
+            entry1_signature_source = "PDB RVA with exact unique signature"
+    else:
+        operator_new_off = find_unique_regex(OPERATOR_NEW_REGEX, text_data)
+        operator_new_rva = text_section.VirtualAddress + operator_new_off
+        operator_new_sig = text_data[operator_new_off : operator_new_off + 26]
+        operator_new_mask = (
+            (1,) * 10 + (0,) + (1,) * 4 + (0,) * 4 +
+            (1,) * 3 + (0,) + (1,) * 3
+        )
+
+        if known_entry1 is None:
+            raise RuntimeError(f"no built-in CreateForHttpServer signature for {args.pe.name}")
+        entry1_sig, entry1_mask = known_entry1
+        entry1_off = find_unique_regex(compile_masked_pattern(entry1_sig, entry1_mask), text_data)
+        entry1_rva = text_section.VirtualAddress + entry1_off
+        entry1_signature_source = "built-in masked fallback"
+
+    operator_new_sig = bytes(
+        value if fixed else 0
+        for value, fixed in zip(operator_new_sig, operator_new_mask)
+    )
     entry1_va = image_base + entry1_rva
-    vtable_candidates = []
-
-    for offset in range(0, len(rdata_data) - 16 + 1, 8):
-        q0, q1 = struct.unpack_from("<QQ", rdata_data, offset)
-        if (
-            q1 == entry1_va
-            and image_base + text_section.VirtualAddress
-            <= q0
-            < image_base + text_section.VirtualAddress + text_section.Misc_VirtualSize
-        ):
-            vtable_candidates.append(rdata_section.VirtualAddress + offset)
+    vtable_candidates = find_vtable_candidates(
+        rdata_data,
+        rdata_section.VirtualAddress,
+        entry1_va,
+        image_base,
+        text_section.VirtualAddress,
+        text_section.Misc_VirtualSize,
+    )
 
     if not vtable_candidates:
         raise RuntimeError("failed to derive TCPServerSocketFactory vtable from .rdata")
@@ -117,16 +195,21 @@ def main():
         "operator_new": {
             "rva": f"0x{operator_new_rva:08X}",
             "va": f"0x{image_base + operator_new_rva:016X}",
-            "signature": OPERATOR_NEW_SIGNATURE,
-            "copy_to_code": "OPERATOR_NEW_SIG",
+            "signature": format_bytes(operator_new_sig),
+            "signature_c_initializer": format_c_initializer(operator_new_sig),
+            "signature_mask_c_initializer": format_c_mask(operator_new_mask),
+            "copy_to_code": "replace OPERATOR_NEW_SIG and OPERATOR_NEW_MASK together",
         },
         "tcp_server_socket_factory": {
             "create_for_http_server": {
                 "rva": f"0x{entry1_rva:08X}",
                 "va": f"0x{entry1_va:016X}",
+                "signature_length": len(entry1_sig),
                 "signature_hex": format_bytes(entry1_sig),
                 "signature_c_initializer": format_c_initializer(entry1_sig),
-                "copy_to_code": "EDGE_ENTRY1_SIG" if args.pe.name.lower() == "msedge.dll" else "CHROME_ENTRY1_SIG",
+                "signature_mask_c_initializer": format_c_mask(entry1_mask),
+                "signature_source": entry1_signature_source,
+                "copy_to_code": "replace EDGE_ENTRY1_SIG and EDGE_ENTRY1_MASK together" if args.pe.name.lower() == "msedge.dll" else "replace CHROME_ENTRY1_SIG and CHROME_ENTRY1_MASK together",
                 "derived_vtable_entry1_candidates": [f"0x{candidate:08X}" for candidate in vtable_candidates],
                 "vtable_entry1_rva": f"0x{vtable_entry1_rva:08X}",
                 "vtable_rva": f"0x{vtable_entry1_rva - 8:08X}",
@@ -152,16 +235,14 @@ def main():
     }
 
     if args.pdb:
-        entry1_result, entry1_demangled = choose_tcp_factory_entry1(args.pe, args.pdb)
         output["pdb"] = str(args.pdb)
-        output["tcp_server_socket_factory"]["create_for_http_server"]["symbol"] = entry1_demangled
-        output["tcp_server_socket_factory"]["create_for_http_server"]["pdb_rva"] = f"0x{entry1_result.symbol.rva:08X}"
+        output["operator_new"]["symbol"] = operator_new_symbol.name
+        output["tcp_server_socket_factory"]["create_for_http_server"]["symbol"] = demangle_symbol(entry1_symbol.name)
+        output["tcp_server_socket_factory"]["create_for_http_server"]["pdb_rva"] = f"0x{entry1_symbol.rva:08X}"
         output["tcp_server_socket_factory"]["create_for_http_server"]["pdb_vtable_refs"] = [
-            f"0x{ref:08X}" for ref in entry1_result.vtable_refs
+            f"0x{ref:08X}" for ref in vtable_candidates
         ]
-        output["tcp_server_socket_factory"]["create_for_http_server"]["signature_matches_pdb_rva"] = (
-            entry1_sig_rva == entry1_result.symbol.rva
-        )
+        output["tcp_server_socket_factory"]["create_for_http_server"]["signature_matches_pdb_rva"] = True
 
     print(json.dumps(output, indent=2))
 
