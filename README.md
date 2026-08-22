@@ -1,17 +1,31 @@
 # CDP-Enable-BOF
 
-`CDP-Enable-BOF` is an x64 BOF that enables the Chrome DevTools Protocol in a
-running `msedge.exe` or `chrome.exe` process 
+`CDP-Enable-BOF` enables the Chrome DevTools Protocol in a running x64
+Chrome or Edge browser. It includes separate execution paths for ordinary
+browser processes and Chrome's Windows Process Isolation boundary.
 
 Based on [CDP-Enable](https://github.com/deathflamingo/CDP-Enabler/) and [Modern Session Hijacking by Living off the DevTools Protocol by Cedric Van Bockhaven](https://specterops.io/so-con/)
 
 ## Usage
 
 ```text
-cdp_enable <edge|chrome> <9000-65535>
+cdp-enable <edge|chrome|chrome-iso> [port]
 ```
 
+The default port is `9222`.
+
+```text
+cdp-enable chrome
+cdp-enable chrome-iso
+cdp-enable edge 9301
+```
+
+Use `chrome` for an ordinary Chrome process and `chrome-iso` for Chrome
+running with Process Isolation.
+
 ## How It Works
+
+The normal `chrome` and `edge` modes:
 
 - finds the requested live browser process and its top-level window
 - locates the loaded browser module (`msedge.dll` or `chrome.dll`)
@@ -29,18 +43,41 @@ cdp_enable <edge|chrome> <9000-65535>
 Running the final internal call on the browser UI thread is the key trick that
 makes this reliable in the presence of CFG / TLS / CET-sensitive execution.
 
+`chrome-iso` uses only query-limited handles to the isolated process. It:
+
+- enumerates visible Chrome windows and identifies Chrome rather than Edge
+- resolves the installation root with `QueryFullProcessImageNameW`
+- selects the versioned `chrome.dll` whose PE image size matches the live process
+- resolves the CDP symbols from masked signatures in that local image
+- uses Chrome's `WindowImpl` dispatch and a synchronous `WM_COPYDATA` buffer
+  to make its UI-thread stack executable
+- transfers execution to the buffer with an existing-image User32 hook
+- restores the affected window state and calls `StartRemoteDebuggingServer`
+
+Both modes reject execution unless the server, allocator, factory-method, and
+final vtable resolutions each produce exactly one candidate.
+
+## Build
+
+```powershell
+mingw32-make
+```
+
+This produces `cdp_enable_bof.o` and `cdp_enable_iso_bof.o`. Load
+`cdp_enable_bof.cna` from **Cobalt Strike → Script Manager**; the script chooses
+the correct object for each command.
 
 ## Validate
 
 Use the bundled Python script to prove CDP is up and reachable:
 
 ```powershell
-python .\grab_cookies.py --port 9001 --output cookies.json
+python .\grab_cookies.py --port 9222 --output cookies.json
 ```
 
 If CDP is working, the script will:
 
-- resolve the browser websocket from `http://127.0.0.1:9001/json/version`
+- resolve the browser websocket from `http://127.0.0.1:9222/json/version`
 - connect to the websocket
 - dump cookies to `cookies.json`
 
@@ -57,8 +94,9 @@ Issue: "Failed to resolve symbol signatures"
 Cause: Edge version mismatch - signatures are version-specific
 Solution: See "Finding New Signatures" below
 
-Tested Chrome Version: 147.0.7727.102
-Tested Edge Version: 147.0.3912.98
+Tested ordinary Chrome version: 151.0.7922.174
+Tested process-isolated Chrome version: 151.0.7922.174
+Tested Edge versions: 151.0.4129.101
 
 ## Finding New Signatures
 
@@ -77,8 +115,8 @@ directory. On this machine, the installed DLLs live under versioned
 subdirectories:
 
 ```powershell
-Copy-Item "C:\Program Files\Google\Chrome\Application\147.0.7727.138\chrome.dll" .
-Copy-Item "C:\Program Files (x86)\Microsoft\Edge\Application\147.0.3912.98\msedge.dll" .
+Copy-Item "C:\Program Files\Google\Chrome\Application\<version>\chrome.dll" .
+Copy-Item "C:\Program Files (x86)\Microsoft\Edge\Application\<version>\msedge.dll" .
 ```
 
 ### Pull the matching PDBs
@@ -102,6 +140,23 @@ Find `StartRemoteDebuggingServer`:
 ```powershell
 python .\find_start_server.py .\chrome.dll <full path to chrome.dll.pdb>
 python .\find_start_server.py .\msedge.dll <full path to msedge.dll.pdb>
+```
+
+For the `chrome-iso` object, validate every embedded masked signature against
+a candidate Chrome DLL with:
+
+```powershell
+python .\find_cdp_inputs.py .\chrome.dll --validate-bof-signatures
+```
+
+`start`, `new`, and `entry1` should report exactly one hit. `entry0` is
+an optional destructor aid: zero hits selects the unique executable-vtable
+fallback, while up to 32 hits are resolved by their relationship to `entry1`.
+Pass an explicit BOF source path after `--validate-bof-signatures` when needed.
+To derive a candidate mask after identifying the symbol RVAs in two builds:
+
+```powershell
+python .\find_cdp_inputs.py .\new\chrome.dll --diff-mask .\old\chrome.dll <old-rva> <new-rva> <length>
 ```
 
 Example Edge output:
@@ -185,7 +240,7 @@ helper at lines 228 and 234 if that helper drifts.
 
 - x64 only
 - tested with both `msedge.exe` and `chrome.exe`
-- the BOF only targets the browser you explicitly pass as an argument
+- the BOF only targets the browser mode explicitly passed as an argument
 - the current Chrome resolver uses a stronger masked `CreateForHttpServer`
   signature to avoid false positives across patch-level browser changes
 
