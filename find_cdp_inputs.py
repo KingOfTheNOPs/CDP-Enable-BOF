@@ -75,6 +75,70 @@ def compile_masked_pattern(signature: bytes, mask) -> bytes:
     )
 
 
+def load_c_byte_arrays(source: Path):
+    text = source.read_text(encoding="utf-8")
+    arrays = {}
+    for name, body in re.findall(
+        r"static\s+const\s+BYTE\s+(\w+)\s*\[\]\s*=\s*\{(.*?)\};",
+        text,
+        re.S,
+    ):
+        arrays[name] = bytes(
+            int(value.strip(), 0)
+            for value in body.split(",")
+            if value.strip()
+        )
+    return arrays
+
+
+def validate_bof_signatures(text_data: bytes, text_rva: int, source: Path):
+    arrays = load_c_byte_arrays(source)
+    results = {}
+    rules = {
+        "start": lambda count: count == 1,
+        "new": lambda count: count == 1,
+        "entry1": lambda count: count == 1,
+        "entry0": lambda count: count <= 32,
+    }
+    for name, valid_count in rules.items():
+        signature = arrays.get(name + "_sig")
+        if not signature:
+            raise RuntimeError(f"{source} has no {name}_sig array")
+        mask = arrays.get(name + "_mask", b"\x01" * len(signature))
+        if len(mask) != len(signature):
+            raise RuntimeError(f"{name} signature and mask lengths differ")
+        matches = [
+            match.start()
+            for match in re.finditer(
+                compile_masked_pattern(signature, mask),
+                text_data,
+                re.S,
+            )
+        ]
+        results[name] = {
+            "valid": valid_count(len(matches)),
+            "matches": len(matches),
+            "rvas": [f"0x{text_rva + match:08X}" for match in matches],
+        }
+    return results
+
+
+def compare_build_signatures(new_pe: Path, old_pe: Path, old_rva: int,
+                             new_rva: int, length: int):
+    old_bytes = pefile.PE(str(old_pe)).get_data(old_rva, length)
+    new_bytes = pefile.PE(str(new_pe)).get_data(new_rva, length)
+    if len(old_bytes) != length or len(new_bytes) != length:
+        raise RuntimeError("comparison range is outside one of the PE images")
+    mask = tuple(int(left == right) for left, right in zip(old_bytes, new_bytes))
+    return {
+        "signature_c_initializer": format_c_initializer(old_bytes),
+        "signature_mask_c_initializer": format_c_mask(mask),
+        "stable_bytes": sum(mask),
+        "length": length,
+        "note": "Mask control-flow and RIP-relative fields, then validate the candidate across all available builds.",
+    }
+
+
 def masked_match_at(data: bytes, offset: int, signature: bytes, mask) -> bool:
     if offset < 0 or offset + len(signature) > len(data):
         return False
@@ -111,14 +175,16 @@ def choose_internal_symbols(pe, pdb_path: Path):
 
 
 def find_vtable_candidates(rdata_data: bytes, rdata_rva: int, entry1_va: int, image_base: int,
-                           text_rva: int, text_size: int):
+                           text_rva: int, text_size: int, entry0_vas=None):
     candidates = []
     needle = struct.pack("<Q", entry1_va)
     offset = rdata_data.find(needle)
     while offset != -1:
         if offset >= 8 and offset % 8 == 0:
             q0 = struct.unpack_from("<Q", rdata_data, offset - 8)[0]
-            if image_base + text_rva <= q0 < image_base + text_rva + text_size:
+            if ((entry0_vas is not None and q0 in entry0_vas) or
+                (entry0_vas is None and
+                 image_base + text_rva <= q0 < image_base + text_rva + text_size)):
                 candidates.append(rdata_rva + offset)
         offset = rdata_data.find(needle, offset + 1)
     return candidates
@@ -130,7 +196,31 @@ def main():
     )
     parser.add_argument("pe", type=Path, help="Path to chrome.dll/msedge.dll")
     parser.add_argument("pdb", type=Path, nargs="?", help="Optional path to matching PDB")
+    parser.add_argument(
+        "--validate-bof-signatures",
+        type=Path,
+        nargs="?",
+        const=ROOT / "cdp_enable_iso_bof.c",
+        help="also validate every masked signature embedded in the isolation BOF",
+    )
+    parser.add_argument(
+        "--diff-mask",
+        nargs=4,
+        metavar=("OLD_DLL", "OLD_RVA", "NEW_RVA", "LENGTH"),
+        help="emit a candidate masked signature by comparing two Chrome builds",
+    )
     args = parser.parse_args()
+
+    if args.diff_mask:
+        old_dll, old_rva, new_rva, length = args.diff_mask
+        print(json.dumps(compare_build_signatures(
+            args.pe,
+            Path(old_dll),
+            int(old_rva, 0),
+            int(new_rva, 0),
+            int(length, 0),
+        ), indent=2))
+        return
 
     pe = pefile.PE(str(args.pe))
     image_base = pe.OPTIONAL_HEADER.ImageBase
@@ -244,7 +334,41 @@ def main():
         ]
         output["tcp_server_socket_factory"]["create_for_http_server"]["signature_matches_pdb_rva"] = True
 
+    validation_failed = False
+    if args.validate_bof_signatures:
+        validation = validate_bof_signatures(
+            text_data,
+            text_section.VirtualAddress,
+            args.validate_bof_signatures,
+        )
+        if validation["entry1"]["matches"] == 1:
+            validated_entry1_va = image_base + int(validation["entry1"]["rvas"][0], 16)
+            entry0_vas = {
+                image_base + int(rva, 16)
+                for rva in validation["entry0"]["rvas"]
+            }
+            validated_vtables = find_vtable_candidates(
+                rdata_data,
+                rdata_section.VirtualAddress,
+                validated_entry1_va,
+                image_base,
+                text_section.VirtualAddress,
+                text_section.Misc_VirtualSize,
+                entry0_vas or None,
+            )
+        else:
+            validated_vtables = []
+        validation["vtable"] = {
+            "valid": len(validated_vtables) == 1,
+            "matches": len(validated_vtables),
+            "rvas": [f"0x{candidate - 8:08X}" for candidate in validated_vtables],
+        }
+        output["bof_signature_validation"] = validation
+        validation_failed = any(not result["valid"] for result in validation.values())
+
     print(json.dumps(output, indent=2))
+    if validation_failed:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

