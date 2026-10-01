@@ -21,7 +21,7 @@ cdp-enable edge 9301
 ```
 
 Use `chrome` for an ordinary Chrome process and `chrome-iso` for Chrome
-running with Process Isolation.
+running with [Process Isolation](https://chromeenterprise.google/intl/en_ca/policies/#ProcessIsolationEnabled).
 
 ## How It Works
 
