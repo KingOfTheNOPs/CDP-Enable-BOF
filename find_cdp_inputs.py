@@ -20,6 +20,11 @@ OPERATOR_NEW_REGEX = (
     rb"\x40\x53\x48\x83\xEC\x20\x48\x8B\xD9\xEB."
     rb"\x48\x8B\xCB\xE8....\x85\xC0\x74.\x48\x8B\xCB"
 )
+OPERATOR_NEW_154_REGEX = (
+    rb"\x40\x53\x48\x83\xEC\x20\x48\x8B\xD9\xE8...."
+    rb"\x48\x85\xC0\x75.\x48\x8B\xCB\xE8...."
+    rb"\x85\xC0\x74.\x48\x8B\xCB"
+)
 KNOWN_ENTRY1_PATTERNS = {
     "msedge.dll": (
         bytes.fromhex("48 89 D0 0F B7 51 08 48"),
@@ -101,22 +106,25 @@ def validate_bof_signatures(text_data: bytes, text_rva: int, source: Path):
         "entry0": lambda count: count <= 32,
     }
     for name, valid_count in rules.items():
-        signature = arrays.get(name + "_sig")
-        if not signature:
-            raise RuntimeError(f"{source} has no {name}_sig array")
-        mask = arrays.get(name + "_mask", b"\x01" * len(signature))
-        if len(mask) != len(signature):
-            raise RuntimeError(f"{name} signature and mask lengths differ")
-        matches = [
-            match.start()
-            for match in re.finditer(
-                compile_masked_pattern(signature, mask),
-                text_data,
-                re.S,
-            )
-        ]
+        candidates = ["new_154", "new"] if name == "new" and "new_154_sig" in arrays else [name]
+        for candidate in candidates:
+            signature = arrays.get(candidate + "_sig")
+            if not signature:
+                raise RuntimeError(f"{source} has no {candidate}_sig array")
+            mask = arrays.get(candidate + "_mask", b"\x01" * len(signature))
+            if len(mask) != len(signature):
+                raise RuntimeError(f"{candidate} signature and mask lengths differ")
+            matches = [
+                match.start()
+                for match in re.finditer(
+                    compile_masked_pattern(signature, mask), text_data, re.S
+                )
+            ]
+            if matches or candidate == candidates[-1]:
+                break
         results[name] = {
             "valid": valid_count(len(matches)),
+            "pattern": candidate,
             "matches": len(matches),
             "rvas": [f"0x{text_rva + match:08X}" for match in matches],
         }
@@ -246,13 +254,22 @@ def main():
             entry1_mask = (1,) * len(entry1_sig)
             entry1_signature_source = "PDB RVA with exact unique signature"
     else:
-        operator_new_off = find_unique_regex(OPERATOR_NEW_REGEX, text_data)
+        new_154_matches = [m.start() for m in re.finditer(OPERATOR_NEW_154_REGEX, text_data, re.S)]
+        if len(new_154_matches) > 1:
+            raise RuntimeError(f"expected one Chromium 154+ allocator match, got {len(new_154_matches)}")
+        operator_new_off = new_154_matches[0] if new_154_matches else find_unique_regex(OPERATOR_NEW_REGEX, text_data)
         operator_new_rva = text_section.VirtualAddress + operator_new_off
-        operator_new_sig = text_data[operator_new_off : operator_new_off + 26]
-        operator_new_mask = (
-            (1,) * 10 + (0,) + (1,) * 4 + (0,) * 4 +
-            (1,) * 3 + (0,) + (1,) * 3
-        )
+        if new_154_matches:
+            operator_new_mask = (
+                (1,) * 10 + (0,) * 4 + (1,) * 4 + (0,) +
+                (1,) * 4 + (0,) * 4 + (1,) * 3 + (0,) + (1,) * 3
+            )
+        else:
+            operator_new_mask = (
+                (1,) * 10 + (0,) + (1,) * 4 + (0,) * 4 +
+                (1,) * 3 + (0,) + (1,) * 3
+            )
+        operator_new_sig = text_data[operator_new_off : operator_new_off + len(operator_new_mask)]
 
         if known_entry1 is None:
             raise RuntimeError(f"no built-in CreateForHttpServer signature for {args.pe.name}")

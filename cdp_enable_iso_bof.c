@@ -85,6 +85,17 @@ static const BYTE start_mask[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
                                   1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 0,
                                   0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1};
 static const BYTE new_sig[] = {0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0xeb};
+/* Chromium 154+ changed operator new to call malloc directly. */
+static const BYTE new_154_sig[] = {
+    0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0xe8,
+    0, 0, 0, 0, 0x48, 0x85, 0xc0, 0x75, 0,
+    0x48, 0x8b, 0xcb, 0xe8, 0, 0, 0, 0,
+    0x85, 0xc0, 0x74, 0, 0x48, 0x8b, 0xcb};
+static const BYTE new_154_mask[] = {
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    0, 0, 0, 0, 1, 1, 1, 1, 0,
+    1, 1, 1, 1, 0, 0, 0, 0,
+    1, 1, 1, 0, 1, 1, 1};
 static const BYTE entry0_sig[] = {0x56, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0xce, 0xf6, 0xc2,
                                   0x01, 0x74, 0x08, 0x48, 0x89, 0xf1, 0xe8, 0,    0,    0,
                                   0,    0x48, 0x89, 0xf0, 0x48, 0x83, 0xc4, 0x20, 0x5e, 0xc3};
@@ -264,7 +275,9 @@ static int resolve_local(HMODULE chrome, uintptr_t* start, uintptr_t* chrome_new
   if (!pe_sections(chrome, &text, &ts, &rdata, &rs, image_size)) return 1;
   if (scan(text, ts, start_sig, start_mask, sizeof(start_sig), one, 1) != 1) return 2;
   *start = one[0];
-  if (scan(text, ts, new_sig, 0, sizeof(new_sig), one, 1) != 1) return 3;
+  int new_hits = scan(text, ts, new_154_sig, new_154_mask, sizeof(new_154_sig), one, 1);
+  if (new_hits == 0) new_hits = scan(text, ts, new_sig, 0, sizeof(new_sig), one, 1);
+  if (new_hits != 1) return 3;
   *chrome_new = one[0];
   int ne = scan(text, ts, entry1_sig, entry1_mask, sizeof(entry1_sig), entry1, 1);
   if (ne != 1) return 4;
