@@ -16,7 +16,7 @@ sub run_cdp_enable {
     $count = size(@_);
 
     if ($count < 2 || $count > 3) {
-        berror($bid, "Usage: cdp-enable <edge|chrome|chrome-iso> [port]");
+        berror($bid, "Usage: cdp-enable <edge|chrome|chrome-iso|edge-iso> [port]");
         return;
     }
 
@@ -32,8 +32,8 @@ sub run_cdp_enable {
     }
 
     if ($browser ne "edge" && $browser ne "chrome" &&
-        $browser ne "chrome-iso") {
-        berror($bid, "browser must be 'edge', 'chrome', or 'chrome-iso'");
+        $browser ne "chrome-iso" && $browser ne "edge-iso") {
+        berror($bid, "browser must be 'edge', 'chrome', 'chrome-iso', or 'edge-iso'");
         return;
     }
 
@@ -44,6 +44,10 @@ sub run_cdp_enable {
 
     if ($browser eq "chrome-iso") {
         $object = "cdp_enable_iso_bof.o";
+        $args = bof_pack($bid, "i", $port);
+    }
+    else if ($browser eq "edge-iso") {
+        $object = "cdp_enable_edge_iso_bof.o";
         $args = bof_pack($bid, "i", $port);
     }
     else {
@@ -64,5 +68,5 @@ alias("cdp-enable", &run_cdp_enable);
 beacon_command_register(
     "cdp-enable",
     "Enable Chrome DevTools Protocol in a running browser.",
-    "Usage: cdp-enable <edge|chrome|chrome-iso> [port]"
+    "Usage: cdp-enable <edge|chrome|chrome-iso|edge-iso> [port]"
 );

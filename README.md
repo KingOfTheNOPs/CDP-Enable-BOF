@@ -2,14 +2,14 @@
 
 `CDP-Enable-BOF` enables the Chrome DevTools Protocol in a running x64
 Chrome or Edge browser. It includes separate execution paths for ordinary
-browser processes and Chrome's Windows Process Isolation boundary.
+browser processes and the Windows Process Isolation boundary in Chrome and Edge.
 
 Based on [CDP-Enable](https://github.com/deathflamingo/CDP-Enabler/) and [Modern Session Hijacking by Living off the DevTools Protocol by Cedric Van Bockhaven](https://specterops.io/so-con/)
 
 ## Usage
 
 ```text
-cdp-enable <edge|chrome|chrome-iso> [port]
+cdp-enable <edge|chrome|chrome-iso|edge-iso> [port]
 ```
 
 The default port is `9222`.
@@ -17,11 +17,12 @@ The default port is `9222`.
 ```text
 cdp-enable chrome
 cdp-enable chrome-iso
+cdp-enable edge-iso
 cdp-enable edge 9301
 ```
 
-Use `chrome` for an ordinary Chrome process and `chrome-iso` for Chrome
-running with [Process Isolation](https://chromeenterprise.google/intl/en_ca/policies/#ProcessIsolationEnabled).
+Use `chrome` or `edge` for an ordinary browser process. Use `chrome-iso` or
+`edge-iso` when the corresponding browser runs with Process Isolation enabled.
 
 ## How It Works
 
@@ -43,11 +44,12 @@ The normal `chrome` and `edge` modes:
 Running the final internal call on the browser UI thread is the key trick that
 makes this reliable in the presence of CFG / TLS / CET-sensitive execution.
 
-`chrome-iso` uses only query-limited handles to the isolated process. It:
+The `chrome-iso` and `edge-iso` modes use only query-limited handles to the
+isolated process. They:
 
-- enumerates visible Chrome windows and identifies Chrome rather than Edge
+- enumerate visible Chromium windows and identify the requested browser by its installed module
 - resolves the installation root with `QueryFullProcessImageNameW`
-- selects the versioned `chrome.dll` whose PE image size matches the live process
+- select the versioned `chrome.dll` or `msedge.dll` whose PE image size matches the live process
 - resolves the CDP symbols from masked signatures in that local image
 - uses Chrome's `WindowImpl` dispatch and a synchronous `WM_COPYDATA` buffer
   to make its UI-thread stack executable
@@ -63,7 +65,8 @@ final vtable resolutions each produce exactly one candidate.
 mingw32-make
 ```
 
-This produces `cdp_enable_bof.o` and `cdp_enable_iso_bof.o`. Load
+This produces `cdp_enable_bof.o`, `cdp_enable_iso_bof.o`, and
+`cdp_enable_edge_iso_bof.o`. Load
 `cdp_enable_bof.cna` from **Cobalt Strike → Script Manager**; the script chooses
 the correct object for each command.
 
@@ -97,6 +100,7 @@ Solution: See "Finding New Signatures" below
 Tested ordinary Chrome version: 151.0.7922.174
 Tested process-isolated Chrome version: 151.0.7922.174
 Tested Edge versions: 151.0.4129.101
+Tested process-isolated Edge version: 157.0.4341.46
 
 ## Finding New Signatures
 
@@ -142,11 +146,12 @@ python .\find_start_server.py .\chrome.dll <full path to chrome.dll.pdb>
 python .\find_start_server.py .\msedge.dll <full path to msedge.dll.pdb>
 ```
 
-For the `chrome-iso` object, validate every embedded masked signature against
-a candidate Chrome DLL with:
+For either isolation object, validate every embedded masked signature against
+the corresponding browser DLL with:
 
 ```powershell
 python .\find_cdp_inputs.py .\chrome.dll --validate-bof-signatures
+python .\find_cdp_inputs.py .\msedge.dll --validate-bof-signatures .\cdp_enable_edge_iso_bof.c
 ```
 
 `start`, `new`, and `entry1` should report exactly one hit. `entry0` is

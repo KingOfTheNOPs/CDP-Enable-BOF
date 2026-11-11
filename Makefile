@@ -4,10 +4,11 @@ CFLAGS=-O2 -c -Wall -Wextra -ffreestanding -fno-builtin -fno-tree-loop-distribut
 INCLUDES=-I .
 OUT=cdp_enable_bof.o
 ISO_OUT=cdp_enable_iso_bof.o
+EDGE_ISO_OUT=cdp_enable_edge_iso_bof.o
 
 .PHONY: all clean
 
-all: $(OUT) $(ISO_OUT)
+all: $(OUT) $(ISO_OUT) $(EDGE_ISO_OUT)
 
 $(OUT): cdp_enable_bof.c
 	$(CC) $(CFLAGS) -o $@ $< $(INCLUDES)
@@ -17,5 +18,9 @@ $(ISO_OUT): cdp_enable_iso_bof.c
 	$(CC) $(CFLAGS) -o $@ $< $(INCLUDES)
 	$(OBJCOPY) --remove-section .pdata --remove-section .xdata --remove-section .eh_frame $@
 
+$(EDGE_ISO_OUT): cdp_enable_edge_iso_bof.c
+	$(CC) $(CFLAGS) -o $@ $< $(INCLUDES)
+	$(OBJCOPY) --remove-section .pdata --remove-section .xdata --remove-section .eh_frame $@
+
 clean:
-	rm -f $(OUT) $(ISO_OUT)
+	rm -f $(OUT) $(ISO_OUT) $(EDGE_ISO_OUT)
